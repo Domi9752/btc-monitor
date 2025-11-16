@@ -1,0 +1,187 @@
+import os
+import time
+import requests
+import smtplib
+import json
+from email.message import EmailMessage
+from datetime import datetime
+from dotenv import load_dotenv
+
+# Umgebungsvariablen laden
+load_dotenv()
+
+# Konfiguration
+SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASS = os.getenv("SMTP_PASS")
+EMAIL_TO = os.getenv("EMAIL_TO", "dominikschee@gmx.de")
+EMAIL_FROM = os.getenv("EMAIL_FROM", SMTP_USER)
+
+PRICE_TRIGGER = float(os.getenv("PRICE_TRIGGER", 98000))
+OI_SPIKE_PCT = float(os.getenv("OI_SPIKE_PCT", 5.0))
+EXCHANGE_FLOW_THRESHOLD = float(os.getenv("EXCHANGE_FLOW_THRESHOLD", 1000.0))  # BTC
+
+CG_API = "https://api.coingecko.com/api/v3"
+BINANCE_API = "https://api.binance.com"
+
+SYMBOL = os.getenv("SYMBOL", "BTCUSDT")  # Binance-Symbol für Klins/Open Interest
+COIN_ID = os.getenv("COIN_ID", "bitcoin")  # CoinGecko-ID
+
+def send_email(subject, body):
+    try:
+        msg = EmailMessage()
+        msg["From"] = EMAIL_FROM
+        msg["To"] = EMAIL_TO
+        msg["Subject"] = subject
+        msg.set_content(body)
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASS)
+            s.send_message(msg)
+    except Exception as e:
+        print(f"Fehler beim Senden der E-Mail: {e}")
+
+def cg_price():
+    r = requests.get(f"{CG_API}/simple/price", params={"ids": COIN_ID, "vs_currencies": "usd"}, timeout=20)
+    r.raise_for_status()
+    return float(r.json()[COIN_ID]["usd"])
+
+def cg_hist_closes(days=30):
+    r = requests.get(f"{CG_API}/coins/{COIN_ID}/market_chart", params={"vs_currency": "usd", "days": days, "interval": "daily"}, timeout=30)
+    r.raise_for_status()
+    closes = [p[1] for p in r.json().get("prices", [])]
+    return closes
+
+def binance_klines(symbol, interval="1d", limit=30):
+    r = requests.get(f"{BINANCE_API}/api/v3/klines", params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def binance_open_interest(symbol):
+    r = requests.get(f"{BINANCE_API}/fapi/v1/openInterest", params={"symbol": symbol}, timeout=20)
+    r.raise_for_status()
+    return float(r.json().get("openInterest", 0.0))
+
+def binance_funding_history(symbol, limit=30):
+    r = requests.get(f"{BINANCE_API}/fapi/v1/fundingRate", params={"symbol": symbol, "limit": limit}, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def analyze_and_alert():
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    triggers = []
+
+    # Preis
+    try:
+        price = cg_price()
+    except Exception as e:
+        price = None
+        print(f"Fehler beim Abrufen des Preises: {e}")
+
+    # 2W-Schlusskurse
+    try:
+        closes = cg_hist_closes(days=30)
+        two_w_close = closes[-1] if closes else None
+    except Exception:
+        two_w_close = None
+
+    # Binance-Kerzen für das Volumen
+    try:
+        klines = binance_klines(SYMBOL, interval="1d", limit=21)
+        volumes = [float(k[5]) for k in klines]
+        if len(volumes) >= 14:
+            vol_last7 = sum(volumes[-7:])
+            vol_prev7 = sum(volumes[-14:-7])
+            vol_diff = vol_last7 - vol_prev7
+        else:
+            vol_last7 = vol_prev7 = vol_diff = None
+    except Exception:
+        vol_last7 = vol_prev7 = vol_diff = None
+
+    # Binance Futures Open Interest
+    try:
+        oi_current = binance_open_interest(SYMBOL)
+    except Exception:
+        oi_current = None
+
+    # Funding-Historie
+    try:
+        fund_hist = binance_funding_history(SYMBOL, limit=30)
+        fund_vals = [float(x.get("fundingRate", 0.0)) for x in fund_hist if "fundingRate" in x]
+        fund_last = fund_vals[-1] if fund_vals else None
+    except Exception:
+        fund_last = None
+
+    # OI-Prozentsatz
+    oi_pct = None
+    oi_history_file = "/tmp/oi_snapshot.json"
+    try:
+        if os.path.exists(oi_history_file):
+            with open(oi_history_file, "r") as f:
+                prev = float(json.load(f).get("oi", 0.0))
+        if oi_current is not None:
+            with open(oi_history_file, "w") as f:
+                json.dump({"ts": int(time.time()), "oi": oi_current}, f)
+        if prev and oi_current and prev != 0:
+            oi_pct = (oi_current - prev) / prev * 100.0
+    except Exception:
+        oi_pct = None
+
+    # Trigger-Bedingungen
+    if price is not None and price < PRICE_TRIGGER:
+        triggers.append(f"Preis < {PRICE_TRIGGER:,} USD ({price:,} USD)")
+    if two_w_close is not None and two_w_close < PRICE_TRIGGER:
+        triggers.append(f"Approx 2W-Schluss < {PRICE_TRIGGER:,} USD ({two_w_close:,} USD)")
+    if vol_diff is not None and vol_diff >= EXCHANGE_FLOW_THRESHOLD:
+        triggers.append(f"Binance Spot gehandelte Volumen +{vol_diff:.2f} BTC (letzte 7 vs vorherige 7) >= {EXCHANGE_FLOW_THRESHOLD} BTC")
+    if oi_pct is not None and oi_pct >= OI_SPIKE_PCT:
+        triggers.append(f"Futures Open Interest +{oi_pct:.2f}% vs letztem Snapshot (>= {OI_SPIKE_PCT}%)")
+    if fund_last is not None and fund_last < 0:
+        triggers.append(f"Finanzierung negativ (letzte): {fund_last:.8f}")
+
+    # Starke Kombination: Preis < Schwelle AND oi_pct >= Schwelle AND vol_diff >= Schwelle
+    combo = (price is not None and price < PRICE_TRIGGER) and (oi_pct is not None and oi_pct >= OI_SPIKE_PCT) and (vol_diff is not None and vol_diff >= EXCHANGE_FLOW_THRESHOLD)
+
+    # E-Mail-Nachricht erstellen
+    lines = [f"Zeitstempel: {now}", f"Spotpreis (CoinGecko): {price:,} USD" if price is not None else "Spotpreis: n/a", ""]
+    lines.append("Starke Kombination Alarm: JA" if combo else "Starke Kombination Alarm: NEIN")
+    lines.append("")
+    
+    if triggers:
+        lines.append("Ausgelöste Überprüfungen:")
+        for t in triggers:
+            lines.append("- " + t)
+    else:
+        lines.append("Keine einzelnen Auslöser.")
+
+    lines += ["", "Statistiken (neueste):",
+              f"- Approx 2W-Schluss: {two_w_close:,} USD" if two_w_close is not None else "- 2W-Schluss: n/a",
+              f"- Binance Volumen letzte 7: {vol_last7:.2f} BTC" if vol_last7 is not None else "- Volumen: n/a",
+              f"- Binance Volumen vorherige 7: {vol_prev7:.2f} BTC" if vol_prev7 is not None else "- Volumen vorherige 7: n/a",
+              f"- Volumen-Differenz: {vol_diff:.2f} BTC" if vol_diff is not None else "- Volumen-Differenz: n/a",
+              f"- Futures OI (aktuell): {oi_current:.2f} Verträge" if oi_current is not None else "- OI: n/a",
+              f"- OI-Prozentsatz vs Snapshot: {oi_pct:.2f}%" if oi_pct is not None else "- OI-Prozentsatz: n/a",
+              f"- Finanzierung letzte: {fund_last:.8f}" if fund_last is not None else "- Finanzierung: n/a",
+              "",
+              "Konfigurierte Schwellen:",
+              f"- Preis {PRICE_TRIGGER:,} USD, OI-Spike-Prozentsatz {OI_SPIKE_PCT}%, Volumen-Differenz {EXCHANGE_FLOW_THRESHOLD} BTC (7d vs vorherige 7)"]
+
+    body = "\n".join(lines)
+    subject = f"[BTC Monitor] {'STARKER ALARM' if combo else ('ALARM' if triggers else 'STATUS')} {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
+
+    try:
+        if combo:
+            send_email(subject + " (STARK)", body)
+        elif triggers:
+            send_email(subject, body)
+        else:
+            if datetime.utcnow().hour == 0:
+                send_email(subject + " (tägliche Zusammenfassung)", body)
+    except Exception as e:
+        print("Fehler beim Senden der E-Mail:", e)
+        print(body)
+
+if __name__ == "__main__":
+    analyze_and_alert()
